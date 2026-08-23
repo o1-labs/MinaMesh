@@ -29,7 +29,7 @@ use crate::{
   create_currency, generate_internal_command_transaction_identifier, generate_operations_internal_command,
   generate_operations_user_command, generate_operations_zkapp_command, generate_transaction_metadata,
   util::{Wrapper, DEFAULT_TOKEN_ID},
-  ChainStatus, HasTimestamp, IndexerClient, InternalCommand, InternalCommandMetadata, InternalCommandType, IxSearchTxn,
+  ChainStatus, IndexerClient, InternalCommand, InternalCommandMetadata, InternalCommandType, IxSearchTxn,
   MinaMeshError, Payment, Provenance, TransactionStatus, UserCommand, UserCommandMetadata, UserCommandType,
   ZkAppCommand,
 };
@@ -47,6 +47,201 @@ pub struct ArchiveTip {
 /// The single historical-read interface. The trustless indexer and a raw archive Postgres
 /// are interchangeable adapters behind it. Handlers compose these history reads with the
 /// live [`crate::MinaNode`] where an endpoint spans both axes (e.g. `/network/status`).
+/// A block as the history axis knows it: its identity, and the commands it carries in the
+/// backend-neutral shapes the operation generators already consume.
+///
+/// Adapters return this rather than a `BlockResponse` so that Rosetta assembly happens once,
+/// above the trait. An adapter answers only "what does this backend hold?"; how that is
+/// expressed as operations is not its business, and cannot drift between backends.
+#[derive(Debug)]
+pub struct ArchiveBlock {
+  pub block_identifier: BlockIdentifier,
+  pub parent_block_identifier: BlockIdentifier,
+  /// Block timestamp, unix millis.
+  pub timestamp: i64,
+  pub creator: Option<String>,
+  pub user_commands: Vec<UserCommandMetadata>,
+  pub internal_commands: Vec<InternalCommandMetadata>,
+  /// One entry per zkApp account update; see [`zkapp_commands_to_transactions`].
+  pub zkapp_commands: Vec<ZkAppCommand>,
+}
+
+impl From<ArchiveBlock> for BlockResponse {
+  fn from(block: ArchiveBlock) -> Self {
+    // Internal commands first, then user, then zkApp -- the order the Postgres adapter has
+    // always produced.
+    let mut transactions: Vec<Transaction> = block.internal_commands.iter().map(internal_command_transaction).collect();
+    transactions.extend(block.user_commands.iter().map(|meta| Transaction {
+      transaction_identifier: Box::new(TransactionIdentifier::new(meta.hash.clone())),
+      metadata: generate_transaction_metadata(meta),
+      operations: generate_operations_user_command(meta),
+      related_transactions: None,
+    }));
+    transactions.extend(zkapp_commands_to_transactions(block.zkapp_commands));
+
+    BlockResponse {
+      block: Some(Box::new(Block {
+        block_identifier: Box::new(block.block_identifier),
+        parent_block_identifier: Box::new(block.parent_block_identifier),
+        timestamp: block.timestamp,
+        transactions,
+        metadata: block.creator.map(|creator| json!({ "creator": creator })),
+      })),
+      other_transactions: None,
+    }
+  }
+}
+
+/// An account's balance at a historical block, as the history axis knows it. Adapters report
+/// the numbers; how they are expressed as a Rosetta `AccountBalanceResponse` is decided once,
+/// above the trait.
+///
+/// Adapters return `Option<ArchiveAccountBalance>`: `None` says the account does not exist at
+/// that block, which is a real answer a full-history archive can give. It is *not* the same as
+/// being unable to see the account, which an archive holding a window of history can hit and
+/// which is [`MinaMeshError::AccountNotVisible`]. Collapsing the two -- reporting a zero balance
+/// because nothing was found -- tells a caller an account is empty when the truth may be that it
+/// is merely older than the blocks held.
+#[derive(Debug, Clone)]
+pub enum ArchiveAccountBalance {
+  Found {
+    block_identifier: BlockIdentifier,
+    /// The token the balance is denominated in. Always known for an account that exists; the
+    /// case where it was not is now [`ArchiveAccountBalance::Absent`].
+    token_id: String,
+    total_balance: u64,
+    liquid_balance: u64,
+    locked_balance: u64,
+    nonce: u64,
+  },
+  /// The account does not exist at that block. Rosetta expresses this as a zero balance, but
+  /// only an adapter that can see the whole history may say it.
+  Absent { block_identifier: BlockIdentifier },
+}
+
+impl From<ArchiveAccountBalance> for AccountBalanceResponse {
+  fn from(balance: ArchiveAccountBalance) -> Self {
+    match balance {
+      ArchiveAccountBalance::Found {
+        block_identifier,
+        token_id,
+        total_balance,
+        liquid_balance,
+        locked_balance,
+        nonce,
+      } => AccountBalanceResponse {
+        block_identifier: Box::new(block_identifier),
+        balances: vec![Amount {
+          currency: Box::new(create_currency(Some(&token_id))),
+          // Rosetta's `value` is the spendable balance; the locked/liquid/total split rides in
+          // metadata, as it has since the OCaml implementation.
+          value: liquid_balance.to_string(),
+          metadata: Some(json!({
+            "locked_balance": locked_balance,
+            "liquid_balance": liquid_balance,
+            "total_balance": total_balance
+          })),
+        }],
+        metadata: Some(json!({
+          "created_via_historical_lookup": true,
+          "nonce": nonce.to_string()
+        })),
+      },
+      // Byte-for-byte what the previous not-found path produced: an absent account is still
+      // reported as a zero balance in the default token, with the same metadata shape. Only the
+      // adapters' obligation changed, not the response.
+      ArchiveAccountBalance::Absent { block_identifier } => AccountBalanceResponse {
+        block_identifier: Box::new(block_identifier),
+        balances: vec![Amount {
+          currency: Box::new(create_currency(None)),
+          value: "0".to_string(),
+          metadata: Some(json!({ "locked_balance": 0, "liquid_balance": 0, "total_balance": 0 })),
+        }],
+        metadata: Some(json!({ "created_via_historical_lookup": true, "nonce": "0" })),
+      },
+    }
+  }
+}
+
+/// One search hit: the command, and which block it was found in.
+#[derive(Debug)]
+pub struct ArchiveSearchCommand {
+  pub block_identifier: BlockIdentifier,
+  /// Block timestamp in unix millis, when the backend can supply one.
+  pub timestamp: Option<i64>,
+  pub command: ArchiveSearchCommandKind,
+}
+
+#[derive(Debug)]
+pub enum ArchiveSearchCommandKind {
+  User(UserCommandMetadata),
+  Internal(InternalCommandMetadata),
+}
+
+/// A page of search results, as the history axis knows it. Adapters own searching, filtering
+/// and pagination -- those are genuinely backend-specific -- but not how a hit is expressed as
+/// a Rosetta `BlockTransaction`, which is decided once by [`ArchiveTransactionPage::into_response`].
+#[derive(Debug)]
+pub struct ArchiveTransactionPage {
+  pub commands: Vec<ArchiveSearchCommand>,
+  /// zkApp hits arrive as one row per account update and are grouped during assembly.
+  pub zkapp_commands: Vec<ZkAppCommand>,
+  pub total_count: i64,
+  pub next_offset: Option<i64>,
+}
+
+impl From<ArchiveSearchCommand> for BlockTransaction {
+  fn from(hit: ArchiveSearchCommand) -> Self {
+    let transaction = match &hit.command {
+      ArchiveSearchCommandKind::User(meta) => Transaction {
+        transaction_identifier: Box::new(TransactionIdentifier::new(meta.hash.clone())),
+        operations: generate_operations_user_command(meta),
+        metadata: generate_transaction_metadata(meta),
+        related_transactions: None,
+      },
+      ArchiveSearchCommandKind::Internal(meta) => internal_command_transaction(meta),
+    };
+    BlockTransaction::new(hit.block_identifier, transaction)
+  }
+}
+
+impl ArchiveTransactionPage {
+  /// Assemble the page. `include_timestamp` is a property of the request, not of the backend,
+  /// so it is applied here rather than threaded into every adapter.
+  pub fn into_response(self, include_timestamp: bool) -> SearchTransactionsResponse {
+    let mut transactions: Vec<BlockTransaction> = self
+      .commands
+      .into_iter()
+      .map(|hit| {
+        let timestamp = hit.timestamp;
+        let mut bt: BlockTransaction = hit.into();
+        bt.timestamp = if include_timestamp { timestamp } else { None };
+        bt
+      })
+      .collect();
+    transactions.extend(zkapp_commands_to_block_transactions(self.zkapp_commands, include_timestamp));
+    SearchTransactionsResponse { transactions, total_count: self.total_count, next_offset: self.next_offset }
+  }
+}
+
+/// Whether a payment is already on chain.
+///
+/// Not a boolean, because the third answer is real and both collapses of it are harmful. Reading
+/// "I cannot tell" as *applied* refuses a legitimate resubmit of a payment that was orphaned;
+/// reading it as *absent* invites a double spend. A full-history archive never returns
+/// [`PaymentHistory::Unknown`]; one holding a window does whenever the payment would predate the
+/// blocks it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaymentHistory {
+  /// Found on the chain that survived.
+  Applied,
+  /// Certainly not applied. A windowed archive may still say this when the sender's nonce has
+  /// not reached the payment's, which rules it out without needing to see the blocks.
+  Absent,
+  /// Cannot be determined from what this archive holds.
+  Unknown,
+}
+
 #[async_trait]
 pub trait MinaArchive: Send + Sync {
   /// How the caller knows these history responses are true. `Verified` for the SNARK-gated
@@ -59,29 +254,41 @@ pub trait MinaArchive: Send + Sync {
   /// The earliest canonical block held — the Rosetta `oldest_block` (archive availability floor).
   async fn oldest_block_identifier(&self) -> Result<BlockIdentifier, MinaMeshError>;
 
-  /// A fully-assembled Rosetta block (with its transactions) by height / state hash / best.
-  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<BlockResponse, MinaMeshError>;
+  /// The block at the given height / state hash / best tip, with the commands it carries.
+  /// Rosetta assembly is done once by `BlockResponse::from`, not by each adapter.
+  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<ArchiveBlock, MinaMeshError>;
 
-  /// Historical balance + nonce for `public_key` at the block named by `partial`.
+  /// Historical balance + nonce for `public_key` at the block named by `partial`. Rosetta
+  /// assembly is done once by `AccountBalanceResponse::from`, not by each adapter.
   async fn historical_balance(
     &self,
     public_key: &str,
     metadata: Option<Value>,
     partial: &PartialBlockIdentifier,
-  ) -> Result<AccountBalanceResponse, MinaMeshError>;
+  ) -> Result<ArchiveAccountBalance, MinaMeshError>;
 
-  /// Search historical transactions.
-  async fn search_transactions(
-    &self,
-    req: &SearchTransactionsRequest,
-  ) -> Result<SearchTransactionsResponse, MinaMeshError>;
+  /// Whether `/account/balance` can be answered for *any* account at a block in range, which is
+  /// what `Allow.historical_balance_lookup` promises a client.
+  ///
+  /// A full-history archive can, so this defaults to true. An archive holding a window of blocks
+  /// cannot without a ledger snapshot at its floor: a block records only the accounts it
+  /// touched, so one that has not moved recently is invisible even though the block the client
+  /// asked about is in range.
+  fn historical_balance_lookup(&self) -> bool {
+    true
+  }
+
+  /// Search historical transactions. Rosetta assembly, and the request's `include_timestamp`,
+  /// are applied once by [`ArchiveTransactionPage::into_response`].
+  async fn search_transactions(&self, req: &SearchTransactionsRequest)
+    -> Result<ArchiveTransactionPage, MinaMeshError>;
 
   /// The best (latest) account nonce, or `None` if the account doesn't exist yet
   /// (`construction/metadata`: current nonce + receiver existence ⇒ creation fee).
   async fn account_nonce(&self, public_key: &str) -> Result<Option<u32>, MinaMeshError>;
 
   /// Whether an exact-match `payment` already exists in history (submit duplicate detection).
-  async fn payment_in_history(&self, payment: &Payment) -> Result<bool, MinaMeshError>;
+  async fn payment_in_history(&self, payment: &Payment) -> Result<PaymentHistory, MinaMeshError>;
 }
 
 // ===========================================================================================
@@ -136,7 +343,7 @@ impl MinaArchive for IndexerArchive {
   /// `InternalCommandMetadata` shapes. Degradations vs Postgres: internal-command transaction
   /// identifiers are synthesized from the block hash (the indexer doesn't expose internal-command
   /// hashes); zkApp commands are not itemized.
-  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<BlockResponse, MinaMeshError> {
+  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<ArchiveBlock, MinaMeshError> {
     let ix = self.resolve_block(partial).await?;
 
     let block_identifier = BlockIdentifier::new(ix.block_height as i64, ix.state_hash.clone());
@@ -148,7 +355,8 @@ impl MinaArchive for IndexerArchive {
     };
     let timestamp: i64 = ix.protocol_state.blockchain_state.utc_date.parse()?;
 
-    let mut transactions: Vec<Transaction> = Vec::new();
+    let mut user_commands: Vec<UserCommandMetadata> = Vec::new();
+    let mut internal_commands: Vec<InternalCommandMetadata> = Vec::new();
 
     // User commands (payments / delegations).
     for uc in &ix.transactions.user_commands {
@@ -175,12 +383,7 @@ impl MinaArchive for IndexerArchive {
         // Postgres `accounts_created` attribution; the generator negates it on the receiver).
         creation_fee: uc.receiver_account_creation_fee_paid.then(|| ACCOUNT_CREATION_FEE.to_string()),
       };
-      transactions.push(Transaction {
-        transaction_identifier: Box::new(TransactionIdentifier::new(meta.hash.clone())),
-        operations: generate_operations_user_command(&meta),
-        metadata: generate_transaction_metadata(&meta),
-        related_transactions: None,
-      });
+      user_commands.push(meta);
     }
 
     // Internal commands: coinbase + fee transfers + SNARK-work fees (all applied; nanomina).
@@ -221,7 +424,7 @@ impl MinaArchive for IndexerArchive {
             status: TransactionStatus::Applied,
             coinbase_receiver: Some(receiver.clone()),
           };
-          transactions.push(internal_command_transaction(&meta));
+          internal_commands.push(meta);
           seq += 1;
         }
       }
@@ -251,19 +454,19 @@ impl MinaArchive for IndexerArchive {
         status: TransactionStatus::Applied,
         coinbase_receiver: producer.clone(),
       };
-      transactions.push(internal_command_transaction(&meta));
+      internal_commands.push(meta);
       seq += 1;
     }
 
-    Ok(BlockResponse {
-      block: Some(Box::new(Block {
-        block_identifier: Box::new(block_identifier),
-        parent_block_identifier: Box::new(parent_block_identifier),
-        timestamp,
-        transactions,
-        metadata: Some(json!({ "creator": ix.creator_account.public_key })),
-      })),
-      other_transactions: None,
+    Ok(ArchiveBlock {
+      block_identifier,
+      parent_block_identifier,
+      timestamp,
+      creator: Some(ix.creator_account.public_key.clone()),
+      user_commands,
+      internal_commands,
+      // The indexer does not itemize zkApp commands on this branch.
+      zkapp_commands: Vec::new(),
     })
   }
 
@@ -275,36 +478,22 @@ impl MinaArchive for IndexerArchive {
     public_key: &str,
     metadata: Option<Value>,
     partial: &PartialBlockIdentifier,
-  ) -> Result<AccountBalanceResponse, MinaMeshError> {
+  ) -> Result<ArchiveAccountBalance, MinaMeshError> {
     let token_id = Wrapper(metadata).token_id_or_default()?;
     let block = self.resolve_block(partial).await?;
     let block_identifier = BlockIdentifier { hash: block.state_hash.clone(), index: block.block_height as i64 };
     match self.client.staged_account(public_key, block.block_height, None).await? {
-      Some(acct) => Ok(AccountBalanceResponse {
-        block_identifier: Box::new(block_identifier),
-        balances: vec![Amount {
-          currency: Box::new(create_currency(Some(&token_id))),
-          value: acct.balance_nano.to_string(),
-          metadata: Some(json!({
-            "locked_balance": 0,
-            "liquid_balance": acct.balance_nano,
-            "total_balance": acct.balance_nano
-          })),
-        }],
-        metadata: Some(json!({
-          "created_via_historical_lookup": true,
-          "nonce": acct.nonce.to_string()
-        })),
+      Some(acct) => Ok(ArchiveAccountBalance::Found {
+        block_identifier,
+        token_id,
+        total_balance: acct.balance_nano,
+        liquid_balance: acct.balance_nano,
+        locked_balance: 0,
+        nonce: acct.nonce as u64,
       }),
-      None => Ok(AccountBalanceResponse {
-        block_identifier: Box::new(block_identifier),
-        balances: vec![Amount {
-          currency: Box::new(create_currency(None)),
-          value: "0".to_string(),
-          metadata: Some(json!({ "locked_balance": 0, "liquid_balance": 0, "total_balance": 0 })),
-        }],
-        metadata: Some(json!({ "created_via_historical_lookup": true, "nonce": "0" })),
-      }),
+      // The indexer holds the staged ledger at that block, so not finding the account means it
+      // does not exist there.
+      None => Ok(ArchiveAccountBalance::Absent { block_identifier }),
     }
   }
 
@@ -316,9 +505,8 @@ impl MinaArchive for IndexerArchive {
   async fn search_transactions(
     &self,
     req: &SearchTransactionsRequest,
-  ) -> Result<SearchTransactionsResponse, MinaMeshError> {
+  ) -> Result<ArchiveTransactionPage, MinaMeshError> {
     let qp = SearchTransactionsQueryParams::try_from(req.clone())?;
-    let include_timestamp = req.include_timestamp.unwrap_or(false);
     let limit = req.limit.unwrap_or(100).max(0) as usize;
     let offset = req.offset.unwrap_or(0).max(0) as usize;
     let max_height = qp.max_block.map(|h| h as u32);
@@ -354,11 +542,12 @@ impl MinaArchive for IndexerArchive {
     }
 
     let total_count = txns.len() as i64;
-    let transactions: Vec<BlockTransaction> =
-      txns.iter().skip(offset).take(limit).map(|t| ix_search_to_block_transaction(t, include_timestamp)).collect();
-    let next_offset = offset as i64 + transactions.len() as i64;
-    Ok(SearchTransactionsResponse {
-      transactions,
+    let commands: Vec<ArchiveSearchCommand> = txns.iter().skip(offset).take(limit).map(ix_search_to_command).collect();
+    let next_offset = offset as i64 + commands.len() as i64;
+    Ok(ArchiveTransactionPage {
+      commands,
+      // The indexer's search covers user commands only.
+      zkapp_commands: Vec::new(),
       total_count,
       next_offset: if next_offset < total_count { Some(next_offset) } else { None },
     })
@@ -368,18 +557,29 @@ impl MinaArchive for IndexerArchive {
     self.client.account_nonce(public_key).await
   }
 
-  async fn payment_in_history(&self, payment: &Payment) -> Result<bool, MinaMeshError> {
+  async fn payment_in_history(&self, payment: &Payment) -> Result<PaymentHistory, MinaMeshError> {
     let sender = &payment.from;
     let receiver = &payment.to;
     let nonce = payment.nonce as i64;
     // Scan the sender's recent commands for an exact duplicate.
-    let txns = self.client.account_transactions(sender, true, None, 200).await?;
-    Ok(txns.iter().any(|t| {
+    const SCAN: usize = 200;
+    let txns = self.client.account_transactions(sender, true, None, SCAN).await?;
+    let found = txns.iter().any(|t| {
       t.nonce as i64 == nonce
         && t.amount == payment.amount
         && t.fee == payment.fee
         && t.to.as_deref() == Some(receiver.as_str())
-    }))
+    });
+    if found {
+      return Ok(PaymentHistory::Applied);
+    }
+    // The scan is bounded, so a full page means older commands were not looked at and this
+    // payment could be among them. Saying `Absent` there is a false negative, and a false
+    // negative here is a duplicate submission.
+    if txns.len() >= SCAN {
+      return Ok(PaymentHistory::Unknown);
+    }
+    Ok(PaymentHistory::Absent)
   }
 }
 
@@ -401,51 +601,28 @@ impl PostgresArchive {
     Self { pool, search_tx_optimized }
   }
 
-  async fn user_commands(&self, metadata: &BlockMetadata) -> Result<Vec<Transaction>, MinaMeshError> {
-    let metadata = sqlx::query_file_as!(UserCommandMetadata, "sql/queries/user_commands.sql", metadata.id)
-      .fetch_all(&self.pool)
-      .await?;
-    let transactions = metadata
-      .into_iter()
-      .map(|item| Transaction {
-        transaction_identifier: Box::new(TransactionIdentifier::new(item.hash.clone())),
-        metadata: generate_transaction_metadata(&item),
-        operations: generate_operations_user_command(&item),
-        related_transactions: None,
-      })
-      .collect();
-    Ok(transactions)
+  async fn user_commands(&self, metadata: &BlockMetadata) -> Result<Vec<UserCommandMetadata>, MinaMeshError> {
+    Ok(
+      sqlx::query_file_as!(UserCommandMetadata, "sql/queries/user_commands.sql", metadata.id)
+        .fetch_all(&self.pool)
+        .await?,
+    )
   }
 
-  async fn internal_commands(&self, metadata: &BlockMetadata) -> Result<Vec<Transaction>, MinaMeshError> {
-    let metadata =
+  async fn internal_commands(&self, metadata: &BlockMetadata) -> Result<Vec<InternalCommandMetadata>, MinaMeshError> {
+    Ok(
       sqlx::query_file_as!(InternalCommandMetadata, "sql/queries/internal_commands.sql", metadata.id, DEFAULT_TOKEN_ID)
         .fetch_all(&self.pool)
-        .await?;
-    let transactions = metadata
-      .into_iter()
-      .map(|item| {
-        let transaction_identifier = generate_internal_command_transaction_identifier(
-          &item.command_type,
-          item.sequence_no,
-          item.secondary_sequence_no,
-          &item.hash,
-        );
-        Transaction::new(
-          TransactionIdentifier::new(transaction_identifier),
-          generate_operations_internal_command(&item),
-        )
-      })
-      .collect();
-    Ok(transactions)
+        .await?,
+    )
   }
 
-  async fn zkapp_commands(&self, metadata: &BlockMetadata) -> Result<Vec<Transaction>, MinaMeshError> {
-    let zkapp_commands =
+  async fn zkapp_commands(&self, metadata: &BlockMetadata) -> Result<Vec<ZkAppCommand>, MinaMeshError> {
+    Ok(
       sqlx::query_file_as!(ZkAppCommand, "sql/queries/zkapp_commands.sql", metadata.id, DEFAULT_TOKEN_ID)
         .fetch_all(&self.pool)
-        .await?;
-    Ok(zkapp_commands_to_transactions(zkapp_commands))
+        .await?,
+    )
   }
 
   async fn block_metadata(
@@ -622,7 +799,7 @@ impl MinaArchive for PostgresArchive {
     Ok(BlockIdentifier::new(oldest_block.height, oldest_block.state_hash))
   }
 
-  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<BlockResponse, MinaMeshError> {
+  async fn block(&self, partial: &PartialBlockIdentifier) -> Result<ArchiveBlock, MinaMeshError> {
     let metadata = match self.block_metadata(partial).await? {
       Some(metadata) => metadata,
       None => return Err(MinaMeshError::BlockMissing(partial.index, partial.hash.clone())),
@@ -644,18 +821,14 @@ impl MinaArchive for PostgresArchive {
       self.zkapp_commands(&metadata)
     )?;
 
-    let all_commands: Vec<_> =
-      internal_commands.into_iter().chain(user_commands.into_iter()).chain(zkapp_commands.into_iter()).collect();
-
-    Ok(BlockResponse {
-      block: Some(Box::new(Block {
-        block_identifier: Box::new(block_identifier),
-        parent_block_identifier: Box::new(parent_block_identifier),
-        timestamp: metadata.timestamp.parse()?,
-        transactions: all_commands,
-        metadata: Some(json!({ "creator": metadata.creator })),
-      })),
-      other_transactions: None,
+    Ok(ArchiveBlock {
+      block_identifier,
+      parent_block_identifier,
+      timestamp: metadata.timestamp.parse()?,
+      creator: Some(metadata.creator),
+      user_commands,
+      internal_commands,
+      zkapp_commands,
     })
   }
 
@@ -664,7 +837,7 @@ impl MinaArchive for PostgresArchive {
     public_key: &str,
     metadata: Option<Value>,
     partial: &PartialBlockIdentifier,
-  ) -> Result<AccountBalanceResponse, MinaMeshError> {
+  ) -> Result<ArchiveAccountBalance, MinaMeshError> {
     let index = partial.index;
     let hash = partial.hash.clone();
     let block = sqlx::query_file!("sql/queries/maybe_block.sql", index, hash)
@@ -680,14 +853,9 @@ impl MinaArchive for PostgresArchive {
     .fetch_optional(&self.pool)
     .await?;
     match maybe_account_balance_info {
-      None => Ok(AccountBalanceResponse {
-        block_identifier: Box::new(build_block_identifier(block.height, block.state_hash, index, hash)?),
-        balances: vec![Amount {
-          currency: Box::new(create_currency(None)),
-          value: "0".to_string(),
-          metadata: Some(json!({ "locked_balance": 0, "liquid_balance": 0, "total_balance": 0 })),
-        }],
-        metadata: Some(json!({ "created_via_historical_lookup": true, "nonce": "0" })),
+      // The archive holds all history, so no row means the account does not exist at that block.
+      None => Ok(ArchiveAccountBalance::Absent {
+        block_identifier: build_block_identifier(block.height, block.state_hash, index, hash)?,
       }),
       Some(account_balance_info) => {
         let token_id = account_balance_info.token_id;
@@ -713,18 +881,13 @@ impl MinaArchive for PostgresArchive {
         };
         let total_balance = last_relevant_command_balance;
         let locked_balance = total_balance - liquid_balance;
-        Ok(AccountBalanceResponse {
-          block_identifier: Box::new(build_block_identifier(block.height, block.state_hash, index, hash)?),
-          balances: vec![Amount {
-            currency: Box::new(create_currency(Some(&token_id))),
-            value: liquid_balance.to_string(),
-            metadata: Some(json!({
-              "locked_balance": locked_balance,
-              "liquid_balance": liquid_balance,
-              "total_balance": total_balance
-            })),
-          }],
-          metadata: Some(json!({ "created_via_historical_lookup": true, "nonce": format!("{}", nonce) })),
+        Ok(ArchiveAccountBalance::Found {
+          block_identifier: build_block_identifier(block.height, block.state_hash, index, hash)?,
+          token_id,
+          total_balance,
+          liquid_balance,
+          locked_balance,
+          nonce: nonce as u64,
         })
       }
     }
@@ -733,33 +896,33 @@ impl MinaArchive for PostgresArchive {
   async fn search_transactions(
     &self,
     req: &SearchTransactionsRequest,
-  ) -> Result<SearchTransactionsResponse, MinaMeshError> {
+  ) -> Result<ArchiveTransactionPage, MinaMeshError> {
     let original_offset = req.offset.unwrap_or(0);
     let mut offset = original_offset;
     let mut limit = req.limit.unwrap_or(100);
-    let mut transactions = Vec::new();
+    let mut commands: Vec<ArchiveSearchCommand> = Vec::new();
+    let mut zkapp_rows: Vec<ZkAppCommand> = Vec::new();
     let mut total_count = 0;
 
     let query_params = SearchTransactionsQueryParams::try_from(req.clone())?;
-    let include_timestamp = req.include_timestamp.unwrap_or(false);
 
     // User Commands
     let user_commands = self.fetch_user_commands(&query_params, offset, limit).await?;
     let user_commands_total_count = user_commands.first().and_then(|uc| uc.total_count).unwrap_or(0);
-    let user_transactions_bt: Vec<BlockTransaction> = map_to_block_transactions(user_commands, include_timestamp);
-    transactions.extend(user_transactions_bt);
+    commands.extend(user_commands.into_iter().map(ArchiveSearchCommand::from));
     total_count += user_commands_total_count;
 
     // Internal Commands
     let mut internal_commands_bt_len = 0;
-    if limit > transactions.len() as i64 {
+    if limit > commands.len() as i64 {
       // if we are below the limit, fetch internal commands
-      (offset, limit) = adjust_limit_and_offset(limit, offset, transactions.len() as i64);
+      (offset, limit) = adjust_limit_and_offset(limit, offset, commands.len() as i64);
       let internal_commands = self.fetch_internal_commands(&query_params, offset, limit).await?;
       let internal_commands_total_count = internal_commands.first().and_then(|ic| ic.total_count).unwrap_or(0);
-      let internal_commands_bt: Vec<BlockTransaction> = map_to_block_transactions(internal_commands, include_timestamp);
+      let internal_commands_bt: Vec<ArchiveSearchCommand> =
+        internal_commands.into_iter().map(ArchiveSearchCommand::from).collect();
       internal_commands_bt_len = internal_commands_bt.len();
-      transactions.extend(internal_commands_bt);
+      commands.extend(internal_commands_bt);
       total_count += internal_commands_total_count;
     } else {
       // otherwise only fetch the first internal command to get the total count
@@ -769,13 +932,12 @@ impl MinaArchive for PostgresArchive {
     }
 
     // ZkApp Commands
-    if limit > transactions.len() as i64 {
+    if limit > commands.len() as i64 {
       // if we are below the limit, fetch zkapp commands
       (offset, limit) = adjust_limit_and_offset(limit, offset, internal_commands_bt_len as i64);
       let zkapp_commands = self.fetch_zkapp_commands(&query_params, offset, limit).await?;
       let zkapp_commands_total_count = zkapp_commands.first().and_then(|ic| ic.total_count).unwrap_or(0);
-      let zkapp_commands_bt = zkapp_commands_to_block_transactions(zkapp_commands, include_timestamp);
-      transactions.extend(zkapp_commands_bt);
+      zkapp_rows.extend(zkapp_commands);
       total_count += zkapp_commands_total_count;
     } else {
       // otherwise only fetch the first zkapp command to get the total count
@@ -784,9 +946,10 @@ impl MinaArchive for PostgresArchive {
       total_count += zkapp_commands_total_count;
     }
 
-    let next_offset = original_offset + transactions.len() as i64;
-    Ok(SearchTransactionsResponse {
-      transactions,
+    let next_offset = original_offset + commands.len() as i64 + zkapp_rows.len() as i64;
+    Ok(ArchiveTransactionPage {
+      commands,
+      zkapp_commands: zkapp_rows,
       total_count,
       next_offset: if next_offset < total_count { Some(next_offset) } else { None },
     })
@@ -801,7 +964,7 @@ impl MinaArchive for PostgresArchive {
     ))
   }
 
-  async fn payment_in_history(&self, payment: &Payment) -> Result<bool, MinaMeshError> {
+  async fn payment_in_history(&self, payment: &Payment) -> Result<PaymentHistory, MinaMeshError> {
     let sender = &payment.from;
     let receiver = &payment.to;
     let nonce = payment.nonce as i64;
@@ -810,7 +973,8 @@ impl MinaArchive for PostgresArchive {
     let row = sqlx::query_file!("sql/queries/query_payment.sql", nonce, sender, receiver, amount, fee)
       .fetch_optional(&self.pool)
       .await?;
-    Ok(row.is_some())
+    // A full-history archive can rule a payment out, so there is no `Unknown` case here.
+    Ok(if row.is_some() { PaymentHistory::Applied } else { PaymentHistory::Absent })
   }
 }
 
@@ -904,21 +1068,6 @@ pub fn zkapp_commands_to_block_transactions(
   result
 }
 
-fn map_to_block_transactions<T>(commands: Vec<T>, include_timestamp: bool) -> Vec<BlockTransaction>
-where
-  T: Into<BlockTransaction> + HasTimestamp,
-{
-  commands
-    .into_iter()
-    .map(|cmd| {
-      let timestamp = cmd.timestamp().map(|ts| ts.parse::<i64>().unwrap_or_default());
-      let mut transaction: BlockTransaction = cmd.into();
-      transaction.timestamp = if include_timestamp { timestamp } else { None };
-      transaction
-    })
-    .collect()
-}
-
 impl From<InternalCommand> for BlockTransaction {
   fn from(internal_command: InternalCommand) -> Self {
     let transaction_identifier = generate_internal_command_transaction_identifier(
@@ -942,6 +1091,56 @@ impl From<InternalCommand> for BlockTransaction {
   }
 }
 
+impl From<UserCommand> for ArchiveSearchCommand {
+  fn from(command: UserCommand) -> Self {
+    let timestamp = command.timestamp.as_ref().and_then(|ts| ts.parse::<i64>().ok());
+    let block_identifier =
+      BlockIdentifier::new(command.height.unwrap_or_default(), command.state_hash.clone().unwrap_or_default());
+    ArchiveSearchCommand {
+      block_identifier,
+      timestamp,
+      command: ArchiveSearchCommandKind::User(UserCommandMetadata {
+        command_type: command.command_type,
+        nonce: command.nonce,
+        amount: command.amount,
+        fee: command.fee,
+        valid_until: command.valid_until,
+        memo: command.memo,
+        hash: command.hash,
+        fee_payer: command.fee_payer,
+        source: command.source,
+        receiver: command.receiver,
+        status: command.status,
+        failure_reason: command.failure_reason,
+        creation_fee: command.creation_fee,
+      }),
+    }
+  }
+}
+
+impl From<InternalCommand> for ArchiveSearchCommand {
+  fn from(command: InternalCommand) -> Self {
+    let timestamp = command.timestamp.as_ref().and_then(|ts| ts.parse::<i64>().ok());
+    let block_identifier =
+      BlockIdentifier::new(command.height.unwrap_or_default(), command.state_hash.clone().unwrap_or_default());
+    ArchiveSearchCommand {
+      block_identifier,
+      timestamp,
+      command: ArchiveSearchCommandKind::Internal(InternalCommandMetadata {
+        command_type: command.command_type,
+        receiver: command.receiver,
+        fee: command.fee,
+        hash: command.hash,
+        creation_fee: command.creation_fee,
+        sequence_no: command.sequence_no,
+        secondary_sequence_no: command.secondary_sequence_no,
+        status: command.status,
+        coinbase_receiver: command.coinbase_receiver,
+      }),
+    }
+  }
+}
+
 impl From<UserCommand> for BlockTransaction {
   fn from(user_command: UserCommand) -> Self {
     let metadata = generate_transaction_metadata(&user_command);
@@ -960,7 +1159,7 @@ impl From<UserCommand> for BlockTransaction {
 
 /// Map an indexer user-command search row into a Rosetta `BlockTransaction`, reusing the
 /// shared operation generators via `UserCommandMetadata`.
-fn ix_search_to_block_transaction(tx: &IxSearchTxn, include_timestamp: bool) -> BlockTransaction {
+fn ix_search_to_command(tx: &IxSearchTxn) -> ArchiveSearchCommand {
   let command_type =
     if tx.kind.to_uppercase().contains("DELEG") { UserCommandType::Delegation } else { UserCommandType::Payment };
   let amount = match command_type {
@@ -982,20 +1181,13 @@ fn ix_search_to_block_transaction(tx: &IxSearchTxn, include_timestamp: bool) -> 
     failure_reason: tx.failure_reason.clone(),
     creation_fee: tx.receiver_account_creation_fee_paid.then(|| ACCOUNT_CREATION_FEE.to_string()),
   };
-  let transaction = Transaction {
-    transaction_identifier: Box::new(TransactionIdentifier::new(tx.hash.clone())),
-    operations: generate_operations_user_command(&meta),
-    metadata: generate_transaction_metadata(&meta),
-    related_transactions: None,
-  };
-  let block_identifier = BlockIdentifier::new(tx.block_height as i64, tx.block.state_hash.clone());
-  let mut bt = BlockTransaction::new(block_identifier, transaction);
-  // The indexer exposes ISO datetimes, not epoch millis, so per-result timestamps aren't
-  // available here (Rosetta wants i64 millis). include_timestamp callers get None.
-  if include_timestamp {
-    bt.timestamp = tx.block.date_time.parse::<i64>().ok();
+  ArchiveSearchCommand {
+    block_identifier: BlockIdentifier::new(tx.block_height as i64, tx.block.state_hash.clone()),
+    // The indexer exposes ISO datetimes, not the epoch millis Rosetta wants, so this parses
+    // only when the value happens to be numeric.
+    timestamp: tx.block.date_time.parse::<i64>().ok(),
+    command: ArchiveSearchCommandKind::User(meta),
   }
-  bt
 }
 
 pub struct SearchTransactionsQueryParams {
@@ -1130,4 +1322,160 @@ fn build_block_identifier(
     hash: db_hash.clone().ok_or(MinaMeshError::BlockMissing(index, hash.clone()))?,
     index: db_height.ok_or(MinaMeshError::BlockMissing(index, hash))?,
   })
+}
+
+#[cfg(test)]
+mod balance_assembly_tests {
+  use coinbase_mesh::models::{AccountBalanceResponse, BlockIdentifier};
+
+  use super::ArchiveAccountBalance;
+  use crate::util::DEFAULT_TOKEN_ID;
+
+  fn balance(token_id: &str, total: u64, liquid: u64, locked: u64) -> ArchiveAccountBalance {
+    ArchiveAccountBalance::Found {
+      block_identifier: BlockIdentifier::new(42, "3NLa".to_string()),
+      token_id: token_id.to_string(),
+      total_balance: total,
+      liquid_balance: liquid,
+      locked_balance: locked,
+      nonce: 7,
+    }
+  }
+
+  /// An account that does not exist reports zero, which is what Rosetta expects — but it is now
+  /// a case an adapter has to choose, not the fallback for anything it failed to find.
+  ///
+  /// The response must be exactly what the previous not-found path produced, including the
+  /// metadata: this change is about what an adapter is allowed to claim, not about the wire.
+  #[test]
+  fn an_absent_account_reports_zero_exactly_as_before() {
+    let response: AccountBalanceResponse =
+      ArchiveAccountBalance::Absent { block_identifier: BlockIdentifier::new(42, "3NLa".to_string()) }.into();
+    let amount = &response.balances[0];
+    assert_eq!(amount.value, "0");
+    assert_eq!(amount.currency.symbol, "MINA");
+    let metadata = amount.metadata.as_ref().expect("the split metadata is part of the response");
+    assert_eq!(metadata["total_balance"], 0);
+    assert_eq!(metadata["liquid_balance"], 0);
+    assert_eq!(metadata["locked_balance"], 0);
+    assert_eq!(response.metadata.as_ref().unwrap()["nonce"], "0");
+    assert_eq!(response.metadata.as_ref().unwrap()["created_via_historical_lookup"], true);
+  }
+
+  // Rosetta's `value` is the spendable balance; the split rides in metadata.
+  #[test]
+  fn value_is_the_liquid_balance_and_the_split_is_metadata() {
+    let response: AccountBalanceResponse = balance(DEFAULT_TOKEN_ID, 1000, 600, 400).into();
+    let amount = &response.balances[0];
+    assert_eq!(amount.value, "600");
+    let metadata = amount.metadata.as_ref().unwrap();
+    assert_eq!(metadata["total_balance"], 1000);
+    assert_eq!(metadata["liquid_balance"], 600);
+    assert_eq!(metadata["locked_balance"], 400);
+  }
+
+  #[test]
+  fn the_nonce_and_block_are_carried_through() {
+    let response: AccountBalanceResponse = balance(DEFAULT_TOKEN_ID, 1, 1, 0).into();
+    assert_eq!(response.block_identifier.index, 42);
+    assert_eq!(response.block_identifier.hash, "3NLa");
+    let metadata = response.metadata.as_ref().unwrap();
+    assert_eq!(metadata["nonce"], "7");
+    assert_eq!(metadata["created_via_historical_lookup"], true);
+  }
+
+  // An account absent at that block reports a default-token zero rather than naming a token it
+  // was never found holding.
+  #[test]
+  fn a_custom_token_is_named_in_the_currency() {
+    let response: AccountBalanceResponse =
+      balance("wTYTc38ab19XT4oPPv7pajgGEUWWXc5AzDKvqqCNiFBfLCCnXK", 5, 5, 0).into();
+    assert_ne!(response.balances[0].currency.symbol, "MINA");
+  }
+}
+
+#[cfg(test)]
+mod search_assembly_tests {
+  use coinbase_mesh::models::BlockIdentifier;
+
+  use super::{ArchiveSearchCommand, ArchiveSearchCommandKind, ArchiveTransactionPage};
+  use crate::{InternalCommandMetadata, InternalCommandType, TransactionStatus, UserCommandMetadata, UserCommandType};
+
+  fn user_hit(hash: &str, timestamp: Option<i64>) -> ArchiveSearchCommand {
+    ArchiveSearchCommand {
+      block_identifier: BlockIdentifier::new(42, "3NLa".to_string()),
+      timestamp,
+      command: ArchiveSearchCommandKind::User(UserCommandMetadata {
+        command_type: UserCommandType::Payment,
+        nonce: 1,
+        amount: Some("2000000000".to_string()),
+        fee: Some("100000000".to_string()),
+        valid_until: None,
+        memo: None,
+        hash: hash.to_string(),
+        fee_payer: "B62qsender".to_string(),
+        source: "B62qsender".to_string(),
+        receiver: "B62qreceiver".to_string(),
+        status: TransactionStatus::Applied,
+        failure_reason: None,
+        creation_fee: None,
+      }),
+    }
+  }
+
+  fn internal_hit() -> ArchiveSearchCommand {
+    ArchiveSearchCommand {
+      block_identifier: BlockIdentifier::new(42, "3NLa".to_string()),
+      timestamp: Some(1_700_000_000_000),
+      command: ArchiveSearchCommandKind::Internal(InternalCommandMetadata {
+        command_type: InternalCommandType::Coinbase,
+        receiver: "B62qproducer".to_string(),
+        fee: Some("720000000000".to_string()),
+        hash: "3NLa".to_string(),
+        creation_fee: None,
+        sequence_no: 0,
+        secondary_sequence_no: 0,
+        status: TransactionStatus::Applied,
+        coinbase_receiver: None,
+      }),
+    }
+  }
+
+  fn page(commands: Vec<ArchiveSearchCommand>) -> ArchiveTransactionPage {
+    ArchiveTransactionPage { commands, zkapp_commands: Vec::new(), total_count: 7, next_offset: Some(2) }
+  }
+
+  #[test]
+  fn hits_become_block_transactions_carrying_their_block() {
+    let response = page(vec![user_hit("5Jtx", None), internal_hit()]).into_response(false);
+    assert_eq!(response.transactions.len(), 2);
+    assert!(response.transactions.iter().all(|bt| bt.block_identifier.index == 42));
+    assert_eq!(response.transactions[0].transaction.transaction_identifier.hash, "5Jtx");
+    // Internal commands get a synthesized identifier, not a bare hash.
+    assert!(response.transactions[1].transaction.transaction_identifier.hash.starts_with("coinbase:"));
+  }
+
+  // include_timestamp is a property of the request, so it is applied here rather than by each
+  // adapter -- which is the point of moving assembly above the trait.
+  #[test]
+  fn timestamps_appear_only_when_the_request_asked_for_them() {
+    let with = page(vec![user_hit("5Jtx", Some(1_700_000_000_000))]).into_response(true);
+    assert_eq!(with.transactions[0].timestamp, Some(1_700_000_000_000));
+
+    let without = page(vec![user_hit("5Jtx", Some(1_700_000_000_000))]).into_response(false);
+    assert_eq!(without.transactions[0].timestamp, None);
+  }
+
+  #[test]
+  fn a_hit_with_no_timestamp_stays_none_even_when_requested() {
+    let response = page(vec![user_hit("5Jtx", None)]).into_response(true);
+    assert_eq!(response.transactions[0].timestamp, None);
+  }
+
+  #[test]
+  fn paging_fields_pass_through() {
+    let response = page(vec![user_hit("5Jtx", None)]).into_response(false);
+    assert_eq!(response.total_count, 7);
+    assert_eq!(response.next_offset, Some(2));
+  }
 }
